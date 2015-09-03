@@ -27,11 +27,11 @@ module.exports = function (grunt) {
   }
 
   function createEnvironmentName(applicationName) {
-    var maxLength      = 23,
+    var maxLength      = 22,
         time           = new Date().getTime().toString(),
         timeLength     = time.length,
         availableSpace = maxLength - applicationName.length,
-        timePart       = time.substring(timeLength - availableSpace, timeLength);
+        timePart       = '-' + time.substring(timeLength - availableSpace, timeLength);
 
     if (applicationName.length > maxLength - 3)
       grunt.log.subhead('Warning: application name is too long to guarantee ' +
@@ -55,7 +55,8 @@ module.exports = function (grunt) {
       updateEnvironment: Q.nbind(eb.updateEnvironment, eb),
       createConfigurationTemplate: Q.nbind(eb.createConfigurationTemplate, eb),
       swapEnvironmentCNAMEs: Q.nbind(eb.swapEnvironmentCNAMEs, eb),
-      createEnvironment: Q.nbind(eb.createEnvironment, eb)
+      createEnvironment: Q.nbind(eb.createEnvironment, eb),
+      terminateEnvironment: Q.nbind(eb.terminateEnvironment, eb)
     };
   }
 
@@ -196,6 +197,7 @@ module.exports = function (grunt) {
         options = this.options({
           versionDescription: '',
           deployType: 'inPlace',
+          terminateOldEnvironment: false,
           deployTimeoutMin: 10,
           deployIntervalSec: 20,
           healthPageTimeoutMin: 5,
@@ -224,7 +226,7 @@ module.exports = function (grunt) {
     }
 
     function createNewEnvironment(env, templateData) {
-      var newEnvName = createEnvironmentName(options.applicationName);
+      var newEnvName = createEnvironmentName(options.environmentName ? options.environmentName : options.applicationName);
 
       grunt.log.write('Creating new environment "' + newEnvName + '"...');
 
@@ -239,8 +241,21 @@ module.exports = function (grunt) {
           });
     }
 
+    function terminateEnvironment(env) {
+        grunt.log.write('Terminating Environment: ' + env.EnvironmentName);
+        grunt.log.debug('nvironment: '+ JSON.stringify(env));
+
+        return qAWS.terminateEnvironment({
+            EnvironmentName: env.EnvironmentName
+        }).then(function () {
+            grunt.log.ok();
+            return env;
+          }, grunt.warn);
+    }
+
     function swapEnvironmentCNAMEs(oldEnv, newEnv) {
       grunt.log.write('Swapping environment CNAMEs...');
+      grunt.log.debug('Source: '+ oldEnv.EnvironmentName + 'Dest: ' + newEnv.EnvironmentName);
 
       return qAWS.swapEnvironmentCNAMEs({
         SourceEnvironmentName: oldEnv.EnvironmentName,
@@ -258,7 +273,14 @@ module.exports = function (grunt) {
             return waitForDeployment(newEnv)
                 .then(waitForHealthPage)
                 .then(swapEnvironmentCNAMEs.bind(task, oldEnv, newEnv))
-                .then(waitForHealthPage);
+                .then(waitForHealthPage)
+                .then(function () {
+                    if (options.deployType == 'swapToNew' && options.terminateOldEnvironment) {
+                        return waitForReady(oldEnv)
+                             .then(terminateEnvironment);
+                    }
+                    return oldEnv;
+                });
           });
     }
 
@@ -279,6 +301,43 @@ module.exports = function (grunt) {
       return updateEnvironment(env)
           .then(waitForDeployment)
           .then(waitForHealthPage);
+    }
+
+    function waitForReady(env) {
+      grunt.log.writeln('Waiting for environment to become ready (timing out in ' +
+          options.deployTimeoutMin + ' minutes)...');
+
+      function checkEnvReady() {
+        return Q.delay(options.deployIntervalSec * 1000)
+            .then(function () {
+              return qAWS.describeEnvironments({
+                ApplicationName: options.applicationName,
+                EnvironmentNames: [env.EnvironmentName],
+                IncludeDeleted: false
+              });
+            })
+            .then(function (data) {
+              if (!data.Environments.length) {
+                grunt.log.writeln('There is no ' +
+                    env.EnvironmentName + ' yet ...');
+                return checkEnvReady();
+              }
+
+              var currentEnv = data.Environments[0];
+
+              if (currentEnv.Status !== 'Ready') {
+                grunt.log.writeln('Environment ' + currentEnv.EnvironmentName +
+                    ' status: ' + currentEnv.Status + '...');
+                return checkEnvReady();
+              }
+
+              grunt.log.writeln(currentEnv.EnvironmentName + ' is Ready');
+
+              return currentEnv;
+            });
+      }
+
+      return Q.timeout(checkEnvReady(), options.deployTimeoutMin * 60 * 1000);
     }
 
     function waitForDeployment(env) {
@@ -332,7 +391,7 @@ module.exports = function (grunt) {
       }
 
       function checkHealthPageStatus() {
-        grunt.log.write('Checking health page status...');
+        grunt.log.write('Checking health page status of ' + env.EnvironmentName + '...');
 
         var deferred = Q.defer();
 
@@ -371,7 +430,7 @@ module.exports = function (grunt) {
 
         if (!options.healthPageContents) return;
 
-        grunt.log.write('Checking health page contents against ' +
+        grunt.log.write('Checking health page contents of ' + env.EnvironmentName + ' against ' +
             options.healthPageContents + '...');
 
         res.setEncoding('utf8');
